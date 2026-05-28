@@ -38,7 +38,7 @@ class Flickr8kDataset(Dataset):
             max_length=self.max_len,
             return_tensors="pt",
         )
-        return image, tokens["input_ids"].squeeze(0), tokens["attention_mask"].squeeze(0)
+        return image, tokens["input_ids"].squeeze(0), tokens["attention_mask"].squeeze(0), idx
 
 
 class Flickr8kEvalDataset:
