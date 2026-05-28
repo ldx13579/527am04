@@ -41,6 +41,7 @@ class Config:
     kg_dim: int = 32
     kg_max_nodes: int = 5
     modality_drop_prob: float = 0.1
+    kg_align_weight: float = 0.05
 
     # Evaluation
     eval_every: int = 2000

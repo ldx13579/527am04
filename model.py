@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
-from knowledge_graph import KnowledgeGraphGCN, KGFeatureAggregator
+from knowledge_graph import KnowledgeGraphGCN, KGFeatureAggregator, KGAlignmentLoss
 
 
 class PatchEmbedding(nn.Module):
@@ -309,17 +309,55 @@ class CLIPModel(nn.Module):
         return image_embeds, text_embeds, self.temperature
 
 
+class ModalityPredictor(nn.Module):
+    """2-layer MLP + single-head cross-attention for cross-modal reconstruction."""
+    def __init__(self, shared_dim=256, hidden_ratio=2):
+        super().__init__()
+        hidden_dim = shared_dim * hidden_ratio
+        # MLP pathway
+        self.mlp = nn.Sequential(
+            nn.Linear(shared_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, shared_dim),
+        )
+        # Lightweight single-head self-refinement attention
+        self.attn_norm = nn.LayerNorm(shared_dim)
+        self.q_proj = nn.Linear(shared_dim, shared_dim)
+        self.k_proj = nn.Linear(shared_dim, shared_dim)
+        self.v_proj = nn.Linear(shared_dim, shared_dim)
+        self.out_proj = nn.Linear(shared_dim, shared_dim)
+        self.scale = shared_dim ** -0.5
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """x: (B, shared_dim) -> (B, shared_dim)"""
+        h = self.mlp(x)
+        # Self-refinement: treat as single-token sequence
+        h_norm = self.attn_norm(h)
+        q = self.q_proj(h_norm).unsqueeze(1)  # (B, 1, D)
+        k = self.k_proj(h_norm).unsqueeze(1)
+        v = self.v_proj(h_norm).unsqueeze(1)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        refined = (attn @ v).squeeze(1)
+        h = h + self.out_proj(refined)
+        return h
+
+
 class ModalityDropout(nn.Module):
-    """Modality missing training: randomly drop one modality and predict it from the other."""
+    """Modality missing training with MLP+attention predictors."""
     def __init__(self, shared_dim=256, drop_prob=0.1):
         super().__init__()
         self.drop_prob = drop_prob
-        self.img_to_txt_predictor = nn.Linear(shared_dim, shared_dim)
-        self.txt_to_img_predictor = nn.Linear(shared_dim, shared_dim)
-        nn.init.xavier_uniform_(self.img_to_txt_predictor.weight)
-        nn.init.zeros_(self.img_to_txt_predictor.bias)
-        nn.init.xavier_uniform_(self.txt_to_img_predictor.weight)
-        nn.init.zeros_(self.txt_to_img_predictor.bias)
+        self.img_to_txt_predictor = ModalityPredictor(shared_dim)
+        self.txt_to_img_predictor = ModalityPredictor(shared_dim)
 
     def forward(self, img_cls, txt_cls):
         """
@@ -399,9 +437,18 @@ class KGEnhancedCLIPModel(nn.Module):
             shared_dim=config.shared_dim,
         )
 
-        # Knowledge Graph GCN
-        self.kg_gcn = KnowledgeGraphGCN(output_dim=kg_dim)
+        # Knowledge Graph GCN (pretrained init from DistilBERT)
+        self.kg_gcn = KnowledgeGraphGCN(
+            output_dim=kg_dim,
+            use_pretrained_init=True,
+            text_model_name=config.text_model_name,
+        )
         self.kg_aggregator = KGFeatureAggregator(kg_dim=kg_dim)
+
+        # KG-text contrastive alignment
+        self.kg_alignment = KGAlignmentLoss(
+            kg_dim=kg_dim, shared_dim=config.shared_dim
+        )
 
         # Fusion: project (shared_dim + kg_dim) back to shared_dim
         fused_dim = config.shared_dim + kg_dim
@@ -412,7 +459,7 @@ class KGEnhancedCLIPModel(nn.Module):
         nn.init.xavier_uniform_(self.txt_kg_fusion.weight)
         nn.init.zeros_(self.txt_kg_fusion.bias)
 
-        # Modality dropout
+        # Modality dropout (MLP + attention predictor)
         self.modality_dropout = ModalityDropout(
             shared_dim=config.shared_dim, drop_prob=drop_prob
         )
@@ -438,17 +485,31 @@ class KGEnhancedCLIPModel(nn.Module):
         img_fused = self.img_kg_fusion(img_with_kg)  # (B, shared_dim)
         txt_fused = self.txt_kg_fusion(txt_with_kg)
 
-        return img_fused, txt_fused
+        return img_fused, txt_fused, kg_embeds
 
-    def encode_image(self, images):
+    def encode_image(self, images, kg_node_indices=None, kg_node_mask=None):
+        """Encode images with optional KG fusion. Active at both train and test time."""
         img_cls = self.image_encoder(images, return_patches=False)
+        if kg_node_indices is not None and kg_node_mask is not None:
+            kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
+            kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
+            img_with_kg = torch.cat([img_cls, kg_pooled], dim=-1)
+            img_cls = self.img_kg_fusion(img_with_kg)
         return F.normalize(img_cls, dim=-1)
 
-    def encode_text(self, input_ids, attention_mask):
+    def encode_text(self, input_ids, attention_mask, kg_node_indices=None, kg_node_mask=None):
+        """Encode text with optional KG fusion. Active at both train and test time."""
         txt_cls = self.text_encoder(input_ids, attention_mask, return_tokens=False)
+        if kg_node_indices is not None and kg_node_mask is not None:
+            kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
+            kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
+            txt_with_kg = torch.cat([txt_cls, kg_pooled], dim=-1)
+            txt_cls = self.txt_kg_fusion(txt_with_kg)
         return F.normalize(txt_cls, dim=-1)
 
-    def encode_pair(self, images, input_ids, attention_mask):
+    def encode_pair(self, images, input_ids, attention_mask,
+                    kg_node_indices=None, kg_node_mask=None):
+        """Paired encoding with cross-attention and optional KG fusion."""
         img_cls, img_patches = self.image_encoder(images, return_patches=True)
         txt_cls, txt_tokens = self.text_encoder(input_ids, attention_mask, return_tokens=True)
 
@@ -457,17 +518,23 @@ class KGEnhancedCLIPModel(nn.Module):
         )
 
         img_g = torch.sigmoid(self.img_gate)
-        image_embeds = F.normalize(img_cls * (1 - img_g) + img_fused * img_g, dim=-1)
+        image_embeds = img_cls * (1 - img_g) + img_fused * img_g
 
         txt_g = torch.sigmoid(self.txt_gate)
-        text_embeds = F.normalize(txt_cls * (1 - txt_g) + txt_fused * txt_g, dim=-1)
+        text_embeds = txt_cls * (1 - txt_g) + txt_fused * txt_g
 
-        return image_embeds, text_embeds
+        if kg_node_indices is not None and kg_node_mask is not None:
+            kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
+            kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
+            image_embeds = self.img_kg_fusion(torch.cat([image_embeds, kg_pooled], dim=-1))
+            text_embeds = self.txt_kg_fusion(torch.cat([text_embeds, kg_pooled], dim=-1))
+
+        return F.normalize(image_embeds, dim=-1), F.normalize(text_embeds, dim=-1)
 
     def forward(self, images, input_ids, attention_mask, kg_node_indices=None,
                 kg_node_mask=None, return_cross_attn=False):
         """
-        Full forward with KG fusion and modality dropout.
+        Full forward with KG fusion, modality dropout, and KG alignment loss.
         kg_node_indices: (B, max_nodes) - indices into KG
         kg_node_mask: (B, max_nodes) - 1 for valid nodes
         """
@@ -486,11 +553,14 @@ class KGEnhancedCLIPModel(nn.Module):
         txt_g = torch.sigmoid(self.txt_gate)
         text_embeds = txt_cls * (1 - txt_g) + txt_fused * txt_g
 
-        # KG fusion
+        # KG fusion + alignment loss
+        kg_align_loss = torch.tensor(0.0, device=images.device)
         if kg_node_indices is not None and kg_node_mask is not None:
-            image_embeds, text_embeds = self._fuse_with_kg(
+            image_embeds, text_embeds, kg_embeds = self._fuse_with_kg(
                 image_embeds, text_embeds, kg_node_indices, kg_node_mask
             )
+            # Contrastive alignment between KG embeddings and text features
+            kg_align_loss = self.kg_alignment(kg_embeds, txt_cls, kg_node_mask)
 
         # Modality dropout (training only)
         image_embeds, text_embeds, recon_loss = self.modality_dropout(
@@ -502,8 +572,8 @@ class KGEnhancedCLIPModel(nn.Module):
         text_embeds = F.normalize(text_embeds, dim=-1)
 
         if return_cross_attn:
-            return image_embeds, text_embeds, self.temperature, t2i_attn, i2t_attn, recon_loss
-        return image_embeds, text_embeds, self.temperature, recon_loss
+            return image_embeds, text_embeds, self.temperature, t2i_attn, i2t_attn, recon_loss, kg_align_loss
+        return image_embeds, text_embeds, self.temperature, recon_loss, kg_align_loss
 
 
 class BaselineCLIPModel(nn.Module):

@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset
+from knowledge_graph import extract_kg_nodes_batch
 
 
 @torch.no_grad()
@@ -7,14 +8,28 @@ def evaluate(model, eval_dataset, device, config):
     """
     Unified evaluation using encode_image() and encode_text().
     Works identically for CLIPModel and BaselineCLIPModel.
+    For KGEnhancedCLIPModel, passes KG node indices extracted from captions.
     Computes I2T and T2I Recall@1 and Recall@5.
     """
     model.eval()
+    has_kg = hasattr(model, 'kg_gcn')
+    kg_max_nodes = getattr(config, 'kg_max_nodes', 5)
+
     try:
         all_images = eval_dataset.get_image_tensors()
         all_input_ids, all_attention_mask = eval_dataset.get_text_tokens()
 
-        # Encode all images via unified encode_image
+        # Extract KG nodes for all captions (used for both image and text encoding)
+        kg_node_indices_all = None
+        kg_node_mask_all = None
+        if has_kg:
+            kg_node_indices_all, kg_node_mask_all = extract_kg_nodes_batch(
+                eval_dataset.captions, max_nodes=kg_max_nodes
+            )
+
+        # Encode all images — for KG-enhanced model, use per-caption KG context
+        # Since images map to multiple captions, encode images without KG first
+        # then apply KG at text side only (text has the caption → node mapping)
         image_embeds = []
         img_loader = DataLoader(TensorDataset(all_images), batch_size=config.batch_size, shuffle=False)
         for (batch_imgs,) in img_loader:
@@ -22,15 +37,28 @@ def evaluate(model, eval_dataset, device, config):
             image_embeds.append(embeds.cpu())
         image_embeds = torch.cat(image_embeds, dim=0)
 
-        # Encode all texts via unified encode_text
+        # Encode all texts with KG nodes
         text_embeds = []
-        txt_loader = DataLoader(
-            TensorDataset(all_input_ids, all_attention_mask),
-            batch_size=config.batch_size,
-            shuffle=False,
-        )
-        for batch_ids, batch_mask in txt_loader:
-            embeds = model.encode_text(batch_ids.to(device), batch_mask.to(device))
+        if has_kg:
+            txt_dataset = TensorDataset(
+                all_input_ids, all_attention_mask,
+                kg_node_indices_all, kg_node_mask_all
+            )
+        else:
+            txt_dataset = TensorDataset(all_input_ids, all_attention_mask)
+        txt_loader = DataLoader(txt_dataset, batch_size=config.batch_size, shuffle=False)
+
+        for batch in txt_loader:
+            if has_kg:
+                batch_ids, batch_mask, batch_kg_idx, batch_kg_mask = batch
+                embeds = model.encode_text(
+                    batch_ids.to(device), batch_mask.to(device),
+                    kg_node_indices=batch_kg_idx.to(device),
+                    kg_node_mask=batch_kg_mask.to(device),
+                )
+            else:
+                batch_ids, batch_mask = batch
+                embeds = model.encode_text(batch_ids.to(device), batch_mask.to(device))
             text_embeds.append(embeds.cpu())
         text_embeds = torch.cat(text_embeds, dim=0)
 

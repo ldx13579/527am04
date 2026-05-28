@@ -46,6 +46,7 @@ def train():
         {"params": model.cross_attention.parameters(), "lr": config.learning_rate},
         {"params": model.kg_gcn.parameters(), "lr": config.learning_rate},
         {"params": model.kg_aggregator.parameters(), "lr": config.learning_rate},
+        {"params": model.kg_alignment.parameters(), "lr": config.learning_rate},
         {"params": model.img_kg_fusion.parameters(), "lr": config.learning_rate},
         {"params": model.txt_kg_fusion.parameters(), "lr": config.learning_rate},
         {"params": model.modality_dropout.parameters(), "lr": config.learning_rate},
@@ -79,7 +80,7 @@ def train():
         kg_node_mask = kg_node_mask.to(device)
 
         with torch.amp.autocast("cuda", enabled=config.use_amp):
-            image_embeds, text_embeds, temperature, t2i_attn, i2t_attn, recon_loss = model(
+            image_embeds, text_embeds, temperature, t2i_attn, i2t_attn, recon_loss, kg_align_loss = model(
                 images, input_ids, attention_mask,
                 kg_node_indices=kg_node_indices,
                 kg_node_mask=kg_node_mask,
@@ -95,7 +96,8 @@ def train():
             loss = (clip_loss
                     + config.grounding_weight * g_loss
                     + config.region_weight * r_loss
-                    + config.recon_weight * recon_loss)
+                    + config.recon_weight * recon_loss
+                    + config.kg_align_weight * kg_align_loss)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -114,6 +116,7 @@ def train():
                 clip=f"{clip_loss.item():.3f}",
                 grnd=f"{g_loss.item():.3f}",
                 recon=f"{recon_loss.item():.3f}",
+                kg_a=f"{kg_align_loss.item():.3f}",
                 ig=f"{torch.sigmoid(model.img_gate).item():.2f}",
                 tg=f"{torch.sigmoid(model.txt_gate).item():.2f}",
             )

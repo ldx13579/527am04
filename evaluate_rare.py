@@ -37,8 +37,12 @@ def evaluate_rare_objects(model, eval_dataset, device, config):
     """
     Evaluate retrieval performance specifically on rare object queries.
     Reports per-object and aggregate Recall@1, Recall@5 for T2I retrieval.
+    For KGEnhancedCLIPModel, passes KG nodes extracted from captions.
     """
     model.eval()
+    has_kg = hasattr(model, 'kg_gcn')
+    kg_max_nodes = getattr(config, 'kg_max_nodes', 5)
+
     try:
         rare_samples = find_rare_object_samples(eval_dataset)
         if not rare_samples:
@@ -48,7 +52,15 @@ def evaluate_rare_objects(model, eval_dataset, device, config):
         all_images = eval_dataset.get_image_tensors()
         all_input_ids, all_attention_mask = eval_dataset.get_text_tokens()
 
-        # Encode all images
+        # Extract KG nodes for all captions
+        kg_node_indices_all = None
+        kg_node_mask_all = None
+        if has_kg:
+            kg_node_indices_all, kg_node_mask_all = extract_kg_nodes_batch(
+                eval_dataset.captions, max_nodes=kg_max_nodes
+            )
+
+        # Encode all images (no KG at image side for independent retrieval)
         image_embeds = []
         img_loader = DataLoader(
             TensorDataset(all_images), batch_size=config.batch_size, shuffle=False
@@ -58,14 +70,28 @@ def evaluate_rare_objects(model, eval_dataset, device, config):
             image_embeds.append(embeds.cpu())
         image_embeds = torch.cat(image_embeds, dim=0)
 
-        # Encode all texts
+        # Encode all texts with KG nodes
         text_embeds = []
-        txt_loader = DataLoader(
-            TensorDataset(all_input_ids, all_attention_mask),
-            batch_size=config.batch_size, shuffle=False,
-        )
-        for batch_ids, batch_mask in txt_loader:
-            embeds = model.encode_text(batch_ids.to(device), batch_mask.to(device))
+        if has_kg:
+            txt_dataset = TensorDataset(
+                all_input_ids, all_attention_mask,
+                kg_node_indices_all, kg_node_mask_all
+            )
+        else:
+            txt_dataset = TensorDataset(all_input_ids, all_attention_mask)
+        txt_loader = DataLoader(txt_dataset, batch_size=config.batch_size, shuffle=False)
+
+        for batch in txt_loader:
+            if has_kg:
+                batch_ids, batch_mask, batch_kg_idx, batch_kg_mask = batch
+                embeds = model.encode_text(
+                    batch_ids.to(device), batch_mask.to(device),
+                    kg_node_indices=batch_kg_idx.to(device),
+                    kg_node_mask=batch_kg_mask.to(device),
+                )
+            else:
+                batch_ids, batch_mask = batch
+                embeds = model.encode_text(batch_ids.to(device), batch_mask.to(device))
             text_embeds.append(embeds.cpu())
         text_embeds = torch.cat(text_embeds, dim=0)
 
