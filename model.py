@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
-from knowledge_graph import KnowledgeGraphGCN, KGFeatureAggregator, KGAlignmentLoss
+from knowledge_graph import KnowledgeGraphGCN, KGFeatureAggregator, KGAlignmentLoss, NUM_NODES
 
 
 class PatchEmbedding(nn.Module):
@@ -309,25 +309,21 @@ class CLIPModel(nn.Module):
         return image_embeds, text_embeds, self.temperature
 
 
-class ModalityPredictor(nn.Module):
-    """2-layer MLP + single-head cross-attention for cross-modal reconstruction."""
+class Img2TxtPredictor(nn.Module):
+    """Deeper network for image→text prediction.
+    Images are information-rich; needs more layers to distill into text space."""
     def __init__(self, shared_dim=256, hidden_ratio=2):
         super().__init__()
         hidden_dim = shared_dim * hidden_ratio
-        # MLP pathway
-        self.mlp = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(shared_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, shared_dim),
         )
-        # Lightweight single-head self-refinement attention
-        self.attn_norm = nn.LayerNorm(shared_dim)
-        self.q_proj = nn.Linear(shared_dim, shared_dim)
-        self.k_proj = nn.Linear(shared_dim, shared_dim)
-        self.v_proj = nn.Linear(shared_dim, shared_dim)
-        self.out_proj = nn.Linear(shared_dim, shared_dim)
-        self.scale = shared_dim ** -0.5
         self._init_weights()
 
     def _init_weights(self):
@@ -337,27 +333,93 @@ class ModalityPredictor(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        """x: (B, shared_dim) -> (B, shared_dim)"""
-        h = self.mlp(x)
-        # Self-refinement: treat as single-token sequence
-        h_norm = self.attn_norm(h)
-        q = self.q_proj(h_norm).unsqueeze(1)  # (B, 1, D)
-        k = self.k_proj(h_norm).unsqueeze(1)
-        v = self.v_proj(h_norm).unsqueeze(1)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        refined = (attn @ v).squeeze(1)
-        h = h + self.out_proj(refined)
+        return self.net(x)
+
+
+class Txt2ImgPredictor(nn.Module):
+    """Wider network for text→image prediction.
+    Text is compact; needs wider hidden layers to expand into visual space."""
+    def __init__(self, shared_dim=256, hidden_ratio=4):
+        super().__init__()
+        hidden_dim = shared_dim * hidden_ratio
+        self.net = nn.Sequential(
+            nn.Linear(shared_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, shared_dim),
+        )
+        # Residual refinement with attention
+        self.refine_norm = nn.LayerNorm(shared_dim)
+        self.refine_proj = nn.Linear(shared_dim, shared_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        h = self.net(x)
+        h = h + self.refine_proj(torch.tanh(self.refine_norm(h)))
         return h
 
 
+class ImageKGClassifier(nn.Module):
+    """Lightweight classification head that predicts KG node presence from image features.
+    Enables autonomous KG knowledge injection from visual content alone."""
+    def __init__(self, shared_dim=256, num_nodes=NUM_NODES):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(shared_dim, shared_dim),
+            nn.GELU(),
+            nn.Linear(shared_dim, num_nodes),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, img_features):
+        """Predict KG node probabilities from image features.
+        img_features: (B, shared_dim)
+        Returns: (B, num_nodes) logits
+        """
+        return self.classifier(img_features)
+
+    def predict_nodes(self, img_features, threshold=0.5, max_nodes=5):
+        """Predict KG nodes from image features at inference time.
+        Returns: (node_indices, node_mask) same format as extract_kg_nodes_batch."""
+        logits = self.forward(img_features)
+        probs = torch.sigmoid(logits)
+        B = img_features.shape[0]
+        device = img_features.device
+        node_indices = torch.zeros(B, max_nodes, dtype=torch.long, device=device)
+        node_mask = torch.zeros(B, max_nodes, device=device)
+
+        for i in range(B):
+            above_thresh = (probs[i] > threshold).nonzero(as_tuple=True)[0]
+            if len(above_thresh) > 0:
+                scores = probs[i, above_thresh]
+                topk = min(max_nodes, len(above_thresh))
+                _, top_idx = scores.topk(topk)
+                selected = above_thresh[top_idx]
+                node_indices[i, :topk] = selected
+                node_mask[i, :topk] = 1.0
+
+        return node_indices, node_mask
+
+
 class ModalityDropout(nn.Module):
-    """Modality missing training with MLP+attention predictors."""
+    """Modality missing training with asymmetric predictors."""
     def __init__(self, shared_dim=256, drop_prob=0.1):
         super().__init__()
         self.drop_prob = drop_prob
-        self.img_to_txt_predictor = ModalityPredictor(shared_dim)
-        self.txt_to_img_predictor = ModalityPredictor(shared_dim)
+        self.img_to_txt_predictor = Img2TxtPredictor(shared_dim)
+        self.txt_to_img_predictor = Txt2ImgPredictor(shared_dim)
 
     def forward(self, img_cls, txt_cls):
         """
@@ -445,6 +507,11 @@ class KGEnhancedCLIPModel(nn.Module):
         )
         self.kg_aggregator = KGFeatureAggregator(kg_dim=kg_dim)
 
+        # Image KG classification head: predicts KG nodes from visual content
+        self.img_kg_classifier = ImageKGClassifier(
+            shared_dim=config.shared_dim, num_nodes=NUM_NODES
+        )
+
         # KG-text contrastive alignment
         self.kg_alignment = KGAlignmentLoss(
             kg_dim=kg_dim, shared_dim=config.shared_dim
@@ -459,7 +526,7 @@ class KGEnhancedCLIPModel(nn.Module):
         nn.init.xavier_uniform_(self.txt_kg_fusion.weight)
         nn.init.zeros_(self.txt_kg_fusion.bias)
 
-        # Modality dropout (MLP + attention predictor)
+        # Modality dropout (asymmetric predictors)
         self.modality_dropout = ModalityDropout(
             shared_dim=config.shared_dim, drop_prob=drop_prob
         )
@@ -487,24 +554,35 @@ class KGEnhancedCLIPModel(nn.Module):
 
         return img_fused, txt_fused, kg_embeds
 
+    def _fuse_single_with_kg(self, embeds, kg_node_indices, kg_node_mask, fusion_layer):
+        """Fuse a single modality embedding with KG."""
+        kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
+        kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
+        fused = fusion_layer(torch.cat([embeds, kg_pooled], dim=-1))
+        return fused
+
     def encode_image(self, images, kg_node_indices=None, kg_node_mask=None):
-        """Encode images with optional KG fusion. Active at both train and test time."""
+        """Encode images with KG fusion.
+        If kg_node_indices not provided, uses visual KG classifier to predict nodes."""
         img_cls = self.image_encoder(images, return_patches=False)
-        if kg_node_indices is not None and kg_node_mask is not None:
-            kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
-            kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
-            img_with_kg = torch.cat([img_cls, kg_pooled], dim=-1)
-            img_cls = self.img_kg_fusion(img_with_kg)
+        if kg_node_indices is None:
+            # Autonomous KG injection: predict nodes from visual content
+            kg_node_indices, kg_node_mask = self.img_kg_classifier.predict_nodes(
+                img_cls, threshold=0.3, max_nodes=getattr(self.config, 'kg_max_nodes', 5)
+            )
+        if kg_node_mask.sum() > 0:
+            img_cls = self._fuse_single_with_kg(
+                img_cls, kg_node_indices, kg_node_mask, self.img_kg_fusion
+            )
         return F.normalize(img_cls, dim=-1)
 
     def encode_text(self, input_ids, attention_mask, kg_node_indices=None, kg_node_mask=None):
         """Encode text with optional KG fusion. Active at both train and test time."""
         txt_cls = self.text_encoder(input_ids, attention_mask, return_tokens=False)
-        if kg_node_indices is not None and kg_node_mask is not None:
-            kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
-            kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
-            txt_with_kg = torch.cat([txt_cls, kg_pooled], dim=-1)
-            txt_cls = self.txt_kg_fusion(txt_with_kg)
+        if kg_node_indices is not None and kg_node_mask is not None and kg_node_mask.sum() > 0:
+            txt_cls = self._fuse_single_with_kg(
+                txt_cls, kg_node_indices, kg_node_mask, self.txt_kg_fusion
+            )
         return F.normalize(txt_cls, dim=-1)
 
     def encode_pair(self, images, input_ids, attention_mask,
@@ -523,7 +601,11 @@ class KGEnhancedCLIPModel(nn.Module):
         txt_g = torch.sigmoid(self.txt_gate)
         text_embeds = txt_cls * (1 - txt_g) + txt_fused * txt_g
 
-        if kg_node_indices is not None and kg_node_mask is not None:
+        if kg_node_indices is None:
+            kg_node_indices, kg_node_mask = self.img_kg_classifier.predict_nodes(
+                img_cls, threshold=0.3, max_nodes=getattr(self.config, 'kg_max_nodes', 5)
+            )
+        if kg_node_mask is not None and kg_node_mask.sum() > 0:
             kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)
             kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)
             image_embeds = self.img_kg_fusion(torch.cat([image_embeds, kg_pooled], dim=-1))
@@ -534,12 +616,26 @@ class KGEnhancedCLIPModel(nn.Module):
     def forward(self, images, input_ids, attention_mask, kg_node_indices=None,
                 kg_node_mask=None, return_cross_attn=False):
         """
-        Full forward with KG fusion, modality dropout, and KG alignment loss.
-        kg_node_indices: (B, max_nodes) - indices into KG
-        kg_node_mask: (B, max_nodes) - 1 for valid nodes
+        Full forward with KG fusion, image KG classification, modality dropout,
+        and KG alignment loss.
         """
         img_cls, img_patches = self.image_encoder(images, return_patches=True)
         txt_cls, txt_tokens = self.text_encoder(input_ids, attention_mask, return_tokens=True)
+
+        # Image KG classification loss (train the visual KG predictor)
+        img_kg_logits = self.img_kg_classifier(img_cls)
+        img_kg_cls_loss = torch.tensor(0.0, device=images.device)
+        if kg_node_indices is not None and kg_node_mask is not None:
+            # Build multi-label target from ground-truth KG nodes
+            B = images.shape[0]
+            kg_targets = torch.zeros(B, NUM_NODES, device=images.device)
+            for i in range(B):
+                valid_nodes = kg_node_indices[i][kg_node_mask[i] > 0]
+                if len(valid_nodes) > 0:
+                    kg_targets[i, valid_nodes] = 1.0
+            img_kg_cls_loss = F.binary_cross_entropy_with_logits(
+                img_kg_logits, kg_targets
+            )
 
         # Cross-attention fusion
         img_fused, txt_fused, t2i_attn, i2t_attn = self.cross_attention(
@@ -559,7 +655,6 @@ class KGEnhancedCLIPModel(nn.Module):
             image_embeds, text_embeds, kg_embeds = self._fuse_with_kg(
                 image_embeds, text_embeds, kg_node_indices, kg_node_mask
             )
-            # Contrastive alignment between KG embeddings and text features
             kg_align_loss = self.kg_alignment(kg_embeds, txt_cls, kg_node_mask)
 
         # Modality dropout (training only)
@@ -572,8 +667,8 @@ class KGEnhancedCLIPModel(nn.Module):
         text_embeds = F.normalize(text_embeds, dim=-1)
 
         if return_cross_attn:
-            return image_embeds, text_embeds, self.temperature, t2i_attn, i2t_attn, recon_loss, kg_align_loss
-        return image_embeds, text_embeds, self.temperature, recon_loss, kg_align_loss
+            return image_embeds, text_embeds, self.temperature, t2i_attn, i2t_attn, recon_loss, kg_align_loss, img_kg_cls_loss
+        return image_embeds, text_embeds, self.temperature, recon_loss, kg_align_loss, img_kg_cls_loss
 
 
 class BaselineCLIPModel(nn.Module):

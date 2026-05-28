@@ -47,6 +47,7 @@ def train():
         {"params": model.kg_gcn.parameters(), "lr": config.learning_rate},
         {"params": model.kg_aggregator.parameters(), "lr": config.learning_rate},
         {"params": model.kg_alignment.parameters(), "lr": config.learning_rate},
+        {"params": model.img_kg_classifier.parameters(), "lr": config.learning_rate},
         {"params": model.img_kg_fusion.parameters(), "lr": config.learning_rate},
         {"params": model.txt_kg_fusion.parameters(), "lr": config.learning_rate},
         {"params": model.modality_dropout.parameters(), "lr": config.learning_rate},
@@ -80,7 +81,7 @@ def train():
         kg_node_mask = kg_node_mask.to(device)
 
         with torch.amp.autocast("cuda", enabled=config.use_amp):
-            image_embeds, text_embeds, temperature, t2i_attn, i2t_attn, recon_loss, kg_align_loss = model(
+            image_embeds, text_embeds, temperature, t2i_attn, i2t_attn, recon_loss, kg_align_loss, img_kg_cls_loss = model(
                 images, input_ids, attention_mask,
                 kg_node_indices=kg_node_indices,
                 kg_node_mask=kg_node_mask,
@@ -93,11 +94,16 @@ def train():
             saliency_map = saliency_estimator(images)
             r_loss = region_loss_fn(t2i_attn, saliency_map, noun_masks, attention_mask)
 
+            # Progressive KG alignment weight: ramp from kg_align_weight_min to kg_align_weight_max
+            progress = min(step / config.total_steps, 1.0)
+            kg_align_w = config.kg_align_weight_min + (config.kg_align_weight_max - config.kg_align_weight_min) * progress
+
             loss = (clip_loss
                     + config.grounding_weight * g_loss
                     + config.region_weight * r_loss
                     + config.recon_weight * recon_loss
-                    + config.kg_align_weight * kg_align_loss)
+                    + kg_align_w * kg_align_loss
+                    + config.img_kg_cls_weight * img_kg_cls_loss)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -114,11 +120,10 @@ def train():
             pbar.set_postfix(
                 loss=f"{loss.item():.3f}",
                 clip=f"{clip_loss.item():.3f}",
-                grnd=f"{g_loss.item():.3f}",
                 recon=f"{recon_loss.item():.3f}",
                 kg_a=f"{kg_align_loss.item():.3f}",
-                ig=f"{torch.sigmoid(model.img_gate).item():.2f}",
-                tg=f"{torch.sigmoid(model.txt_gate).item():.2f}",
+                kg_c=f"{img_kg_cls_loss.item():.3f}",
+                kw=f"{kg_align_w:.2f}",
             )
 
         if step % config.eval_every == 0 or step == config.total_steps:
