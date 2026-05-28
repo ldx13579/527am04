@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
+from knowledge_graph import KnowledgeGraphGCN, KGFeatureAggregator
 
 
 class PatchEmbedding(nn.Module):
@@ -306,6 +307,203 @@ class CLIPModel(nn.Module):
         if return_cross_attn:
             return image_embeds, text_embeds, self.temperature, t2i_attn, i2t_attn
         return image_embeds, text_embeds, self.temperature
+
+
+class ModalityDropout(nn.Module):
+    """Modality missing training: randomly drop one modality and predict it from the other."""
+    def __init__(self, shared_dim=256, drop_prob=0.1):
+        super().__init__()
+        self.drop_prob = drop_prob
+        self.img_to_txt_predictor = nn.Linear(shared_dim, shared_dim)
+        self.txt_to_img_predictor = nn.Linear(shared_dim, shared_dim)
+        nn.init.xavier_uniform_(self.img_to_txt_predictor.weight)
+        nn.init.zeros_(self.img_to_txt_predictor.bias)
+        nn.init.xavier_uniform_(self.txt_to_img_predictor.weight)
+        nn.init.zeros_(self.txt_to_img_predictor.bias)
+
+    def forward(self, img_cls, txt_cls):
+        """
+        During training, with drop_prob probability, drop one modality and
+        predict it from the other.
+        Returns:
+            img_feat: (B, shared_dim) - image features (possibly predicted)
+            txt_feat: (B, shared_dim) - text features (possibly predicted)
+            recon_loss: scalar reconstruction loss
+        """
+        if not self.training:
+            return img_cls, txt_cls, torch.tensor(0.0, device=img_cls.device)
+
+        B = img_cls.shape[0]
+        device = img_cls.device
+        rand = torch.rand(B, device=device)
+
+        # Masks: which samples drop image, which drop text
+        drop_img_mask = (rand < self.drop_prob).float().unsqueeze(-1)  # (B, 1)
+        drop_txt_mask = ((rand >= self.drop_prob) & (rand < 2 * self.drop_prob)).float().unsqueeze(-1)
+
+        # Predict missing modality
+        predicted_img = self.txt_to_img_predictor(txt_cls)
+        predicted_txt = self.img_to_txt_predictor(img_cls)
+
+        # Replace dropped modality with prediction
+        img_feat = img_cls * (1 - drop_img_mask) + predicted_img * drop_img_mask
+        txt_feat = txt_cls * (1 - drop_txt_mask) + predicted_txt * drop_txt_mask
+
+        # Reconstruction loss: MSE between predicted and actual for dropped samples
+        recon_loss = torch.tensor(0.0, device=device)
+        n_dropped = 0
+        if drop_img_mask.sum() > 0:
+            recon_loss = recon_loss + F.mse_loss(
+                predicted_img * drop_img_mask,
+                img_cls.detach() * drop_img_mask,
+                reduction='sum'
+            )
+            n_dropped += drop_img_mask.sum()
+        if drop_txt_mask.sum() > 0:
+            recon_loss = recon_loss + F.mse_loss(
+                predicted_txt * drop_txt_mask,
+                txt_cls.detach() * drop_txt_mask,
+                reduction='sum'
+            )
+            n_dropped += drop_txt_mask.sum()
+        if n_dropped > 0:
+            recon_loss = recon_loss / n_dropped
+
+        return img_feat, txt_feat, recon_loss
+
+
+class KGEnhancedCLIPModel(nn.Module):
+    """CLIPModel enhanced with Knowledge Graph GCN embeddings and modality dropout."""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        kg_dim = getattr(config, 'kg_dim', 32)
+        drop_prob = getattr(config, 'modality_drop_prob', 0.1)
+
+        self.image_encoder = ViTTiny(
+            img_size=config.img_size,
+            patch_size=config.patch_size,
+            dim=config.vit_dim,
+            depth=config.vit_layers,
+            heads=config.vit_heads,
+            mlp_ratio=config.vit_mlp_ratio,
+            shared_dim=config.shared_dim,
+        )
+        self.text_encoder = TextEncoder(
+            model_name=config.text_model_name,
+            shared_dim=config.shared_dim,
+        )
+        self.cross_attention = BidirectionalCrossAttention(
+            img_dim=config.vit_dim,
+            text_dim=config.text_hidden_dim,
+            shared_dim=config.shared_dim,
+        )
+
+        # Knowledge Graph GCN
+        self.kg_gcn = KnowledgeGraphGCN(output_dim=kg_dim)
+        self.kg_aggregator = KGFeatureAggregator(kg_dim=kg_dim)
+
+        # Fusion: project (shared_dim + kg_dim) back to shared_dim
+        fused_dim = config.shared_dim + kg_dim
+        self.img_kg_fusion = nn.Linear(fused_dim, config.shared_dim)
+        self.txt_kg_fusion = nn.Linear(fused_dim, config.shared_dim)
+        nn.init.xavier_uniform_(self.img_kg_fusion.weight)
+        nn.init.zeros_(self.img_kg_fusion.bias)
+        nn.init.xavier_uniform_(self.txt_kg_fusion.weight)
+        nn.init.zeros_(self.txt_kg_fusion.bias)
+
+        # Modality dropout
+        self.modality_dropout = ModalityDropout(
+            shared_dim=config.shared_dim, drop_prob=drop_prob
+        )
+
+        self.img_gate = nn.Parameter(torch.tensor(0.0))
+        self.txt_gate = nn.Parameter(torch.tensor(0.0))
+        self.log_temperature = nn.Parameter(
+            torch.tensor(math.log(1.0 / config.init_temperature))
+        )
+
+    @property
+    def temperature(self):
+        return torch.clamp(self.log_temperature.exp(), min=0.01, max=100.0)
+
+    def _fuse_with_kg(self, img_embeds, txt_embeds, kg_node_indices, kg_node_mask):
+        """Concatenate KG embeddings with image/text features."""
+        kg_embeds = self.kg_gcn.get_embeddings(kg_node_indices)  # (B, max_nodes, 32)
+        kg_pooled = self.kg_aggregator(kg_embeds, kg_node_mask)  # (B, 32)
+
+        img_with_kg = torch.cat([img_embeds, kg_pooled], dim=-1)  # (B, shared_dim+32)
+        txt_with_kg = torch.cat([txt_embeds, kg_pooled], dim=-1)
+
+        img_fused = self.img_kg_fusion(img_with_kg)  # (B, shared_dim)
+        txt_fused = self.txt_kg_fusion(txt_with_kg)
+
+        return img_fused, txt_fused
+
+    def encode_image(self, images):
+        img_cls = self.image_encoder(images, return_patches=False)
+        return F.normalize(img_cls, dim=-1)
+
+    def encode_text(self, input_ids, attention_mask):
+        txt_cls = self.text_encoder(input_ids, attention_mask, return_tokens=False)
+        return F.normalize(txt_cls, dim=-1)
+
+    def encode_pair(self, images, input_ids, attention_mask):
+        img_cls, img_patches = self.image_encoder(images, return_patches=True)
+        txt_cls, txt_tokens = self.text_encoder(input_ids, attention_mask, return_tokens=True)
+
+        img_fused, txt_fused, _, _ = self.cross_attention(
+            img_patches, txt_tokens, text_mask=attention_mask
+        )
+
+        img_g = torch.sigmoid(self.img_gate)
+        image_embeds = F.normalize(img_cls * (1 - img_g) + img_fused * img_g, dim=-1)
+
+        txt_g = torch.sigmoid(self.txt_gate)
+        text_embeds = F.normalize(txt_cls * (1 - txt_g) + txt_fused * txt_g, dim=-1)
+
+        return image_embeds, text_embeds
+
+    def forward(self, images, input_ids, attention_mask, kg_node_indices=None,
+                kg_node_mask=None, return_cross_attn=False):
+        """
+        Full forward with KG fusion and modality dropout.
+        kg_node_indices: (B, max_nodes) - indices into KG
+        kg_node_mask: (B, max_nodes) - 1 for valid nodes
+        """
+        img_cls, img_patches = self.image_encoder(images, return_patches=True)
+        txt_cls, txt_tokens = self.text_encoder(input_ids, attention_mask, return_tokens=True)
+
+        # Cross-attention fusion
+        img_fused, txt_fused, t2i_attn, i2t_attn = self.cross_attention(
+            img_patches, txt_tokens, text_mask=attention_mask
+        )
+
+        # Gated fusion
+        img_g = torch.sigmoid(self.img_gate)
+        image_embeds = img_cls * (1 - img_g) + img_fused * img_g
+
+        txt_g = torch.sigmoid(self.txt_gate)
+        text_embeds = txt_cls * (1 - txt_g) + txt_fused * txt_g
+
+        # KG fusion
+        if kg_node_indices is not None and kg_node_mask is not None:
+            image_embeds, text_embeds = self._fuse_with_kg(
+                image_embeds, text_embeds, kg_node_indices, kg_node_mask
+            )
+
+        # Modality dropout (training only)
+        image_embeds, text_embeds, recon_loss = self.modality_dropout(
+            image_embeds, text_embeds
+        )
+
+        # Normalize
+        image_embeds = F.normalize(image_embeds, dim=-1)
+        text_embeds = F.normalize(text_embeds, dim=-1)
+
+        if return_cross_attn:
+            return image_embeds, text_embeds, self.temperature, t2i_attn, i2t_attn, recon_loss
+        return image_embeds, text_embeds, self.temperature, recon_loss
 
 
 class BaselineCLIPModel(nn.Module):

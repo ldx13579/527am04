@@ -35,6 +35,12 @@ class Config:
     hard_negative_weight: float = 0.5
     grounding_weight: float = 0.3
     region_weight: float = 0.2
+    recon_weight: float = 0.1
+
+    # Knowledge Graph
+    kg_dim: int = 32
+    kg_max_nodes: int = 5
+    modality_drop_prob: float = 0.1
 
     # Evaluation
     eval_every: int = 2000
