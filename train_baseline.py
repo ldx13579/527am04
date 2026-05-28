@@ -1,5 +1,6 @@
 """
 Train baseline model (without cross-attention/grounding) for comparison.
+Uses the same unified encode_image/encode_text interface.
 Saves checkpoint to checkpoints/baseline.pt
 
 Usage:
@@ -8,12 +9,12 @@ Usage:
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 from config import Config
 from dataset import load_flickr8k, get_train_loader
+from model import BaselineCLIPModel
 from loss import CLIPLossWithHardNegatives
 from evaluate import evaluate
 
@@ -26,40 +27,6 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps):
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-class BaselineCLIPModel(nn.Module):
-    """CLIP model without cross-attention (original architecture)."""
-    def __init__(self, config):
-        super().__init__()
-        from model import ViTTiny, TextEncoder
-        import math
-
-        self.image_encoder = ViTTiny(
-            img_size=config.img_size,
-            patch_size=config.patch_size,
-            dim=config.vit_dim,
-            depth=config.vit_layers,
-            heads=config.vit_heads,
-            mlp_ratio=config.vit_mlp_ratio,
-            shared_dim=config.shared_dim,
-        )
-        self.text_encoder = TextEncoder(
-            model_name=config.text_model_name,
-            shared_dim=config.shared_dim,
-        )
-        self.log_temperature = nn.Parameter(
-            torch.tensor(math.log(1.0 / config.init_temperature))
-        )
-
-    @property
-    def temperature(self):
-        return torch.clamp(self.log_temperature.exp(), min=0.01, max=100.0)
-
-    def forward(self, images, input_ids, attention_mask):
-        image_embeds = self.image_encoder(images, return_patches=False)
-        text_embeds = self.text_encoder(input_ids, attention_mask, return_tokens=False)
-        return image_embeds, text_embeds, self.temperature
 
 
 def train_baseline():

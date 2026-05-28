@@ -8,7 +8,7 @@ from config import Config
 from dataset import load_flickr8k, get_train_loader
 from model import CLIPModel
 from loss import CLIPLossWithHardNegatives
-from grounding import NounPhraseExtractor, GroundingLoss
+from grounding import NounPhraseExtractor, GroundingLoss, SaliencyEstimator, RegionSupervisionLoss
 from evaluate import evaluate
 
 
@@ -34,13 +34,16 @@ def train():
     model = CLIPModel(config).to(device)
     criterion = CLIPLossWithHardNegatives(config.hard_negative_weight)
     grounding_loss_fn = GroundingLoss()
+    region_loss_fn = RegionSupervisionLoss()
+    saliency_estimator = SaliencyEstimator(grid_size=14).to(device)
     np_extractor = NounPhraseExtractor()
 
     param_groups = [
         {"params": model.image_encoder.parameters(), "lr": config.learning_rate},
         {"params": model.text_encoder.parameters(), "lr": config.learning_rate * 0.1},
         {"params": model.cross_attention.parameters(), "lr": config.learning_rate},
-        {"params": [model.fuse_gate, model.log_temperature], "lr": config.learning_rate},
+        {"params": [model.img_gate, model.txt_gate, model.log_temperature], "lr": config.learning_rate},
+        {"params": saliency_estimator.parameters(), "lr": config.learning_rate},
     ]
     optimizer = torch.optim.AdamW(param_groups, weight_decay=config.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, config.warmup_steps, config.total_steps)
@@ -52,6 +55,7 @@ def train():
     pbar = tqdm(range(1, config.total_steps + 1), desc="Training")
     for step in pbar:
         model.train()
+        saliency_estimator.train()
         images, input_ids, attention_mask, indices = next(train_iter)
         images = images.to(device)
         input_ids = input_ids.to(device)
@@ -61,16 +65,28 @@ def train():
         noun_masks = np_extractor.extract(captions, tokenizer, config.max_text_len).to(device)
 
         with torch.amp.autocast("cuda", enabled=config.use_amp):
-            image_embeds, text_embeds, temperature, attn_weights = model(
+            image_embeds, text_embeds, temperature, t2i_attn, i2t_attn = model(
                 images, input_ids, attention_mask, return_cross_attn=True
             )
             clip_loss, base_loss, hard_loss = criterion(image_embeds, text_embeds, temperature)
-            g_loss = grounding_loss_fn(attn_weights, noun_masks, attention_mask)
-            loss = clip_loss + config.grounding_weight * g_loss
+
+            # Entropy grounding loss on text→image attention
+            g_loss = grounding_loss_fn(t2i_attn, noun_masks, attention_mask)
+
+            # Saliency region supervision
+            saliency_map = saliency_estimator(images)
+            r_loss = region_loss_fn(t2i_attn, saliency_map, noun_masks, attention_mask)
+
+            loss = (clip_loss
+                    + config.grounding_weight * g_loss
+                    + config.region_weight * r_loss)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        nn.utils.clip_grad_norm_(
+            list(model.parameters()) + list(saliency_estimator.parameters()),
+            config.max_grad_norm
+        )
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
@@ -81,8 +97,9 @@ def train():
                 loss=f"{loss.item():.3f}",
                 clip=f"{clip_loss.item():.3f}",
                 grnd=f"{g_loss.item():.3f}",
-                temp=f"{temperature.item():.2f}",
-                gate=f"{torch.sigmoid(model.fuse_gate).item():.3f}",
+                region=f"{r_loss.item():.3f}",
+                ig=f"{torch.sigmoid(model.img_gate).item():.2f}",
+                tg=f"{torch.sigmoid(model.txt_gate).item():.2f}",
             )
 
         if step % config.eval_every == 0 or step == config.total_steps:
@@ -101,6 +118,7 @@ def train():
                     {
                         "step": step,
                         "model_state_dict": model.state_dict(),
+                        "saliency_state_dict": saliency_estimator.state_dict(),
                         "best_recall": best_recall,
                         "config": config,
                     },

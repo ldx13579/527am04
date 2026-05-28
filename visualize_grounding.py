@@ -1,6 +1,6 @@
 """
 Visualize cross-attention heatmaps for noun phrase grounding.
-Shows which image patches each noun phrase attends to.
+Shows which image patches each noun phrase attends to (text→image direction).
 
 Usage:
     python visualize_grounding.py --checkpoint checkpoints/best_model.pt --num_samples 8
@@ -10,7 +10,6 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from torchvision import transforms
 from transformers import AutoTokenizer
 
@@ -20,22 +19,22 @@ from model import CLIPModel
 from grounding import NounPhraseExtractor
 
 
-def get_noun_phrase_attention(attn_weights, noun_masks, attention_mask):
+def get_noun_phrase_attention(t2i_attn, noun_masks, attention_mask):
     """
-    Extract attention maps for noun phrase tokens.
-    attn_weights: (1, seq_len, 196)
+    Extract average attention map for noun phrase tokens (text→image direction).
+    t2i_attn: (1, seq_len, 196)
     noun_masks: (1, seq_len)
     Returns: (196,) average attention over noun phrase tokens
     """
     valid = (noun_masks[0] * attention_mask[0].float()).bool()
     if valid.sum() == 0:
-        return attn_weights[0].mean(dim=0).detach().cpu().numpy()
-    np_attn = attn_weights[0][valid]  # (num_np_tokens, 196)
+        return t2i_attn[0].mean(dim=0).detach().cpu().numpy()
+    np_attn = t2i_attn[0][valid]  # (num_np_tokens, 196)
     avg_attn = np_attn.mean(dim=0)  # (196,)
     return avg_attn.detach().cpu().numpy()
 
 
-def get_per_phrase_attention(attn_weights, caption, tokenizer, nlp, max_len=64):
+def get_per_phrase_attention(t2i_attn, caption, tokenizer, nlp, max_len=64):
     """
     Get separate attention maps for each noun phrase.
     Returns list of (phrase_text, heatmap_14x14)
@@ -69,7 +68,7 @@ def get_per_phrase_attention(attn_weights, caption, tokenizer, nlp, max_len=64):
         if chunk_mask.sum() == 0:
             continue
 
-        phrase_attn = attn_weights[0][chunk_mask]  # (num_tokens, 196)
+        phrase_attn = t2i_attn[0][chunk_mask]
         avg_attn = phrase_attn.mean(dim=0).detach().cpu().numpy()
         heatmap = avg_attn.reshape(14, 14)
         results.append((chunk.text, heatmap))
@@ -83,13 +82,6 @@ def visualize_samples(model, eval_dataset, tokenizer, config, device, num_sample
 
     np_extractor = NounPhraseExtractor()
     nlp = np_extractor.nlp
-
-    inv_normalize = transforms.Compose([
-        transforms.Normalize(
-            mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
-            std=[1/0.229, 1/0.224, 1/0.225]
-        )
-    ])
 
     val_transform = transforms.Compose([
         transforms.Resize(256),
@@ -113,15 +105,15 @@ def visualize_samples(model, eval_dataset, tokenizer, config, device, num_sample
         attention_mask = tokens["attention_mask"].to(device)
 
         with torch.no_grad():
-            _, _, _, attn_weights = model(
+            _, _, _, t2i_attn, i2t_attn = model(
                 img_tensor, input_ids, attention_mask, return_cross_attn=True
             )
 
         noun_masks = np_extractor.extract([caption], tokenizer, config.max_text_len).to(device)
-        overall_heatmap = get_noun_phrase_attention(attn_weights, noun_masks, attention_mask)
+        overall_heatmap = get_noun_phrase_attention(t2i_attn, noun_masks, attention_mask)
         overall_heatmap = overall_heatmap.reshape(14, 14)
 
-        per_phrase = get_per_phrase_attention(attn_weights, caption, tokenizer, nlp, config.max_text_len)
+        per_phrase = get_per_phrase_attention(t2i_attn, caption, tokenizer, nlp, config.max_text_len)
 
         num_phrases = len(per_phrase)
         fig_cols = 2 + num_phrases
@@ -133,7 +125,7 @@ def visualize_samples(model, eval_dataset, tokenizer, config, device, num_sample
         axes[0].axis("off")
 
         axes[1].imshow(display_img)
-        hm = axes[1].imshow(
+        axes[1].imshow(
             overall_heatmap, cmap="jet", alpha=0.5,
             extent=[0, 224, 224, 0], interpolation="bilinear"
         )
@@ -193,12 +185,12 @@ def visualize_grid(model, eval_dataset, tokenizer, config, device, num_samples=4
         attention_mask = tokens["attention_mask"].to(device)
 
         with torch.no_grad():
-            _, _, _, attn_weights = model(
+            _, _, _, t2i_attn, _ = model(
                 img_tensor, input_ids, attention_mask, return_cross_attn=True
             )
 
         noun_masks = np_extractor.extract([caption], tokenizer, config.max_text_len).to(device)
-        heatmap = get_noun_phrase_attention(attn_weights, noun_masks, attention_mask).reshape(14, 14)
+        heatmap = get_noun_phrase_attention(t2i_attn, noun_masks, attention_mask).reshape(14, 14)
 
         display_img = img_pil.resize((224, 224))
 
@@ -224,7 +216,7 @@ def visualize_grid(model, eval_dataset, tokenizer, config, device, num_samples=4
         caption_short = caption[:60] + "..." if len(caption) > 60 else caption
         axes[row, 0].set_ylabel(f'"{caption_short}"', fontsize=8, rotation=0, labelpad=80, va="center")
 
-    plt.suptitle("Cross-Attention Noun Phrase Grounding Heatmaps", fontsize=14)
+    plt.suptitle("Bidirectional Cross-Attention: Noun Phrase Grounding", fontsize=14)
     plt.tight_layout()
     save_path = os.path.join(output_dir, "grounding_grid.png")
     plt.savefig(save_path, dpi=150, bbox_inches="tight")

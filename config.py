@@ -34,6 +34,7 @@ class Config:
     init_temperature: float = 0.07
     hard_negative_weight: float = 0.5
     grounding_weight: float = 0.3
+    region_weight: float = 0.2
 
     # Evaluation
     eval_every: int = 2000
